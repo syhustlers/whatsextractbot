@@ -81,11 +81,9 @@ def extract_wa_links(text: str) -> list[str]:
 
 async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
     """
-    Robustly checks WhatsApp link status using WhatsApp's preview crawler headers 
-    to retrieve exact server-side Open Graph metadata.
+    Bulletproof validation using WhatsApp preview crawler user-agent,
+    response integrity checks, and expanded failure/approval signatures.
     """
-    # Using WhatsApp's official link-preview user agent forces the server 
-    # to return accurate group status metadata in the response headers/HTML.
     headers = {
         "User-Agent": "WhatsApp/2.23.2.74 A",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -95,13 +93,17 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
     try:
         response = await client.get(url, headers=headers, follow_redirects=True, timeout=10.0)
         
+        # Response integrity guard: Catch WAF blocks, rate-limits, or cloud IP bans (429, 403, 503)
+        if response.status_code in [429, 403, 503, 500]:
+            return {"url": url, "valid": False, "approval_required": False, "reason": "Rate Limited / Blocked"}
+        
         if response.status_code != 200:
             return {"url": url, "valid": False, "approval_required": False, "reason": "HTTP Error"}
 
-html_text = response.text
+        html_text = response.text
         soup = BeautifulSoup(html_text, 'html.parser')
         
-        # Extract Open Graph tags
+        # Extract Open Graph metadata tags rendered by WhatsApp servers
         og_desc = ""
         og_title = ""
         meta_desc = soup.find("meta", property="og:description")
@@ -113,7 +115,7 @@ html_text = response.text
 
         combined_text = f"{html_text} {og_desc} {og_title}".lower()
         
-        # Comprehensive keyword checks for dead, revoked, or reset links
+        # Expanded invalid/reset keyword signatures
         invalid_keywords = [
             "invite link is invalid",
             "reset invite link",
@@ -121,19 +123,21 @@ html_text = response.text
             "this invite link was reset",
             "expired",
             "revoked",
-            "doesn't exist"
+            "doesn't exist",
+            "link was reset"
         ]
         if any(kw in combined_text for kw in invalid_keywords):
             return {"url": url, "valid": False, "approval_required": False, "reason": "Revoked/Invalid"}
 
-        # Comprehensive keyword checks for Admin Approval requirements
+        # Expanded admin approval keyword signatures
         approval_keywords = [
             "admin approval needed",
             "admin_approval_required",
             "an admin must approve",
             "request to join",
             "requires_approval",
-            "must approve your request"
+            "must approve your request",
+            "request to join this group"
         ]
         requires_approval = any(kw in combined_text for kw in approval_keywords)
 
@@ -285,7 +289,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def process_and_validate_links(status_message, links: list[str], context: ContextTypes.DEFAULT_TYPE):
-    """Validates links, displays live progress updates, outputs raw lists + .txt file backup, and prompts for next action."""
+    """Validates links, displays live progress updates, outputs strict numbered lists + .txt file backup, and loops buttons."""
     total_links = len(links)
     valid_instant_join_links = []
     
@@ -324,20 +328,21 @@ async def process_and_validate_links(status_message, links: list[str], context: 
         )
         return
 
-    # Deliver raw text block chunks
-    raw_output_text = "\n".join(valid_instant_join_links)
-    await status_message.reply_text("👇 **Here are your instant-join valid WhatsApp group links:**")
+    # Build strict numbered format (1. Link, 2. Link, etc.)
+    numbered_links = [f"{i}. {link}" for i, link in enumerate(valid_instant_join_links, 1)]
+    raw_output_text = "\n".join(numbered_links)
+    
+    await status_message.reply_text("👇 **Here are your numbered instant-join valid WhatsApp group links:**")
     
     max_chars = 3800
     for i in range(0, len(raw_output_text), max_chars):
         chunk = raw_output_text[i:i + max_chars]
         await status_message.reply_text(chunk, disable_web_page_preview=True)
 
-    # Deliver output as attached .txt file backup
+    # Deliver output as attached .txt file backup with looping action buttons
     file_bytes = BytesIO(raw_output_text.encode("utf-8"))
     file_bytes.name = "valid_whatsapp_groups.txt"
     
-    # Automatically prompt user to validate more links right after sending the file
     await context.bot.send_document(
         chat_id=status_message.chat_id,
         document=file_bytes,
@@ -376,4 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
