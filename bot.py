@@ -80,14 +80,16 @@ def extract_wa_links(text: str) -> list[str]:
 
 
 async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    """Robustly checks if a WhatsApp link is active and does not require admin approval."""
+    """
+    Robustly checks WhatsApp link status using WhatsApp's preview crawler headers 
+    to retrieve exact server-side Open Graph metadata.
+    """
+    # Using WhatsApp's official link-preview user agent forces the server 
+    # to return accurate group status metadata in the response headers/HTML.
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "WhatsApp/2.23.2.74 A",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
     }
     
     try:
@@ -96,10 +98,10 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
         if response.status_code != 200:
             return {"url": url, "valid": False, "approval_required": False, "reason": "HTTP Error"}
 
-        html_text = response.text
+html_text = response.text
         soup = BeautifulSoup(html_text, 'html.parser')
         
-        # Extract Open Graph metadata tags rendered by WhatsApp servers
+        # Extract Open Graph tags
         og_desc = ""
         og_title = ""
         meta_desc = soup.find("meta", property="og:description")
@@ -111,24 +113,27 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
 
         combined_text = f"{html_text} {og_desc} {og_title}".lower()
         
-        # Check if the invite link is invalid, revoked, or reset
+        # Comprehensive keyword checks for dead, revoked, or reset links
         invalid_keywords = [
             "invite link is invalid",
             "reset invite link",
             "couldn't find group",
             "this invite link was reset",
-            "expired"
+            "expired",
+            "revoked",
+            "doesn't exist"
         ]
         if any(kw in combined_text for kw in invalid_keywords):
             return {"url": url, "valid": False, "approval_required": False, "reason": "Revoked/Invalid"}
 
-        # Check for Admin Approval requirements
+        # Comprehensive keyword checks for Admin Approval requirements
         approval_keywords = [
             "admin approval needed",
             "admin_approval_required",
             "an admin must approve",
             "request to join",
-            "requires_approval"
+            "requires_approval",
+            "must approve your request"
         ]
         requires_approval = any(kw in combined_text for kw in approval_keywords)
 
@@ -169,25 +174,27 @@ async def fetch_and_extract_from_url(client: httpx.AsyncClient, website_url: str
 # BOT TELEGRAM HANDLERS
 # ==========================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the main menu with inline action buttons."""
-    context.user_data["state"] = STATE_NONE
-    
+def get_main_menu_keyboard():
+    """Returns the main action button markup."""
     keyboard = [
         [InlineKeyboardButton("🌐 Scrape & Validate Websites", callback_data="btn_scrape")],
         [InlineKeyboardButton("📁 Validate Link List / File", callback_data="btn_validate_list")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the main menu with inline action buttons."""
+    context.user_data["state"] = STATE_NONE
     welcome_text = (
         "⚡ **WhatsApp Group Validator & Scraper Bot** ⚡\n\n"
         "Choose an option below to start:"
     )
     
     if update.message:
-        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
     elif update.callback_query:
-        await update.callback_query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.callback_query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,7 +285,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def process_and_validate_links(status_message, links: list[str], context: ContextTypes.DEFAULT_TYPE):
-    """Validates links, displays live progress updates, and outputs raw lists + .txt file backup."""
+    """Validates links, displays live progress updates, outputs raw lists + .txt file backup, and prompts for next action."""
     total_links = len(links)
     valid_instant_join_links = []
     
@@ -310,7 +317,11 @@ async def process_and_validate_links(status_message, links: list[str], context: 
     )
 
     if not valid_instant_join_links:
-        await status_message.reply_text("⚠️ No free-to-join active WhatsApp groups were found in this batch.")
+        await status_message.reply_text(
+            "⚠️ No free-to-join active WhatsApp groups were found in this batch.\n\n"
+            "Would you like to validate another batch or check more websites?",
+            reply_markup=get_main_menu_keyboard()
+        )
         return
 
     # Deliver raw text block chunks
@@ -325,11 +336,14 @@ async def process_and_validate_links(status_message, links: list[str], context: 
     # Deliver output as attached .txt file backup
     file_bytes = BytesIO(raw_output_text.encode("utf-8"))
     file_bytes.name = "valid_whatsapp_groups.txt"
+    
+    # Automatically prompt user to validate more links right after sending the file
     await context.bot.send_document(
         chat_id=status_message.chat_id,
         document=file_bytes,
         filename="valid_whatsapp_groups.txt",
-        caption="📄 **Downloadable `.txt` export of verified instant-join links.**",
+        caption="📄 **Downloadable `.txt` export of verified instant-join links.**\n\n🔄 **Want to validate more? Choose an option below:**",
+        reply_markup=get_main_menu_keyboard(),
         parse_mode="Markdown"
     )
 
