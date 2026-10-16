@@ -2,7 +2,9 @@ import os
 import re
 import asyncio
 import logging
+import random
 import httpx
+import html
 from bs4 import BeautifulSoup
 from io import BytesIO
 import threading
@@ -51,12 +53,6 @@ threading.Thread(target=run_health_server, daemon=True).start()
 # Bot Token
 BOT_TOKEN = "8962511038:AAFvS1LZYYHwjIqVAh3Kx48irYntMcb9Y-Q"
 
-# Regex pattern for WhatsApp group invite links
-WA_LINK_REGEX = re.compile(
-    r"https?://chat\.whatsapp\.com/(?:invite/)?([a-zA-Z0-9]{20,24})",
-    re.IGNORECASE
-)
-
 # User state constants
 STATE_NONE = 0
 STATE_AWAITING_WEBSITES = 1
@@ -64,12 +60,143 @@ STATE_AWAITING_LINKS = 2
 
 
 # ==========================================
-# HELPER & VALIDATION FUNCTIONS
+# ADVANCED WA VALIDATOR ENGINE (From wa_validator.py)
 # ==========================================
+CODE_RE = re.compile(r"chat\.whatsapp\.com/(?:invite/)?([A-Za-z0-9_-]{20,24})", re.I)
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
+
+GENERIC_TITLES = {"", "whatsapp", "whatsapp group invite", "whatsapp web", "whatsapp messenger"}
+
+DEAD_PHRASES = (
+    "invite link was reset", "invite link is invalid", "invite link has been revoked",
+    "invite link is no longer valid", "couldn't find group", "could not find group",
+    "link has expired", "group doesn't exist", "no longer available",
+)
+APPROVAL_PHRASES = (
+    "request to join", "admin must approve", "admins must approve",
+    "approve your request", "approval required", "pending approval",
+)
+BLOCK_MARKERS = (
+    "just a moment", "cf-chl", "cf-browser-verification", "attention required",
+    "captcha", "access denied", "checking your browser",
+)
+RETRY_STATUS = {403, 429, 500, 502, 503, 504}
+
+
+def _result(url, valid, approval, reason, status):
+    return {"url": url, "valid": valid, "approval_required": approval,
+            "reason": reason, "status": status}
+
+
+def _meta(soup: BeautifulSoup, prop: str) -> str:
+    tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+    return (tag.get("content") or "").strip() if tag else ""
+
+
+async def _sleep_backoff(attempt: int, retry_after: str | None = None):
+    delay = min(2 ** attempt, 20) + random.uniform(0.2, 1.0)
+    if retry_after and retry_after.isdigit():
+        delay = max(delay, min(int(retry_after), 30))
+    await asyncio.sleep(delay)
+
+
+async def validate_wa_link(client: httpx.AsyncClient, url: str, max_attempts: int = 4) -> dict:
+    m = CODE_RE.search(url or "")
+    if not m:
+        return _result(url, False, False, "malformed_link", "dead")
+    canonical = f"https://chat.whatsapp.com/{m.group(1)}"
+
+    last_reason = "unknown_error"
+    for attempt in range(max_attempts):
+        try:
+            r = await client.get(canonical, headers=HEADERS, follow_redirects=True, timeout=15.0)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_reason = f"network_error:{type(e).__name__}"
+            await _sleep_backoff(attempt)
+            continue
+
+        if r.status_code in RETRY_STATUS:
+            last_reason = f"blocked_or_rate_limited_http_{r.status_code}"
+            await _sleep_backoff(attempt, r.headers.get("retry-after"))
+            continue
+        if r.status_code == 404:
+            return _result(canonical, False, False, "http_404", "dead")
+        if r.status_code != 200:
+            return _result(canonical, False, False, f"unexpected_http_{r.status_code}", "unknown")
+
+        if not str(r.url.host).endswith(("whatsapp.com", "whatsapp.net")):
+            last_reason = "redirected_off_whatsapp"
+            await _sleep_backoff(attempt)
+            continue
+
+        html_text = r.text or ""
+        low = html_text.lower()
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        title = _meta(soup, "og:title")
+        image = _meta(soup, "og:image")
+        has_og = bool(title or image or _meta(soup, "og:description"))
+
+        if not has_og and (len(html_text) < 500 or any(b in low[:30000] for b in BLOCK_MARKERS)):
+            last_reason = "challenge_or_masked_response"
+            await _sleep_backoff(attempt)
+            continue
+
+        visible = soup.get_text(" ", strip=True).lower()
+
+        has_name = title.lower() not in GENERIC_TITLES
+        img_host = re.sub(r"^https?://([^/]+).*$", r"\1", image).lower() if image else ""
+        has_avatar = img_host.endswith("whatsapp.net")
+
+        if not has_name:
+            for p in DEAD_PHRASES:
+                if p in visible:
+                    return _result(canonical, False, False, f"dead_link:'{p}'", "dead")
+            if has_og:
+                return _result(canonical, False, False, "dead_link:generic_fallback_page", "dead")
+            last_reason = "unrecognised_page"
+            await _sleep_backoff(attempt)
+            continue
+
+        for p in DEAD_PHRASES:
+            if p in visible:
+                return _result(canonical, False, False, f"dead_link:'{p}'", "dead")
+
+        approval = any(p in visible or p in low for p in APPROVAL_PHRASES)
+        if approval:
+            return _result(canonical, True, True,
+                           f"active_group:'{title}' (admin approval wording found)", "active")
+
+        note = "" if has_avatar else ", no_avatar"
+        return _result(canonical, True, False,
+                       f"active_group:'{title}'{note} (approval flag not exposed by public page)",
+                       "active")
+
+    return _result(canonical, False, False, last_reason, "unknown")
+
+
+# ==========================================
+# EXTRACTION HELPERS (Original Working Method)
+# ==========================================
 def extract_wa_links(text: str) -> list[str]:
-    """Extracts unique, normalized WhatsApp invite links from text."""
-    matches = WA_LINK_REGEX.findall(text)
+    """Extracts unique, normalized WhatsApp invite links from text[span_1](start_span)[span_1](end_span)."""
+    if not text:
+        return []
+    cleaned_text = html.unescape(text)
+    matches = CODE_RE.findall(cleaned_text)
     unique_links = []
     seen = set()
     for code in matches:
@@ -79,75 +206,8 @@ def extract_wa_links(text: str) -> list[str]:
     return unique_links
 
 
-async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    """Robustly checks WhatsApp link status using WhatsApp's preview crawler headers."""
-    headers = {
-        "User-Agent": "WhatsApp/2.23.2.74 A",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-    
-    try:
-        response = await client.get(url, headers=headers, follow_redirects=True, timeout=10.0)
-        
-        if response.status_code in [429, 403, 503, 500]:
-            return {"url": url, "valid": False, "approval_required": False, "reason": "Rate Limited / Blocked"}
-        
-        if response.status_code != 200:
-            return {"url": url, "valid": False, "approval_required": False, "reason": "HTTP Error"}
-
-        html_text = response.text
-        soup = BeautifulSoup(html_text, 'html.parser')
-        
-        og_desc = ""
-        og_title = ""
-        meta_desc = soup.find("meta", property="og:description")
-        if meta_desc:
-            og_desc = meta_desc.get("content", "")
-        meta_title = soup.find("meta", property="og:title")
-        if meta_title:
-            og_title = meta_title.get("content", "")
-
-        combined_text = f"{html_text} {og_desc} {og_title}".lower()
-        
-        invalid_keywords = [
-            "invite link is invalid",
-            "reset invite link",
-            "couldn't find group",
-            "this invite link was reset",
-            "expired",
-            "revoked",
-            "doesn't exist",
-            "link was reset"
-        ]
-        if any(kw in combined_text for kw in invalid_keywords):
-            return {"url": url, "valid": False, "approval_required": False, "reason": "Revoked/Invalid"}
-
-        approval_keywords = [
-            "admin approval needed",
-            "admin_approval_required",
-            "an admin must approve",
-            "request to join",
-            "requires_approval",
-            "must approve your request",
-            "request to join this group"
-        ]
-        requires_approval = any(kw in combined_text for kw in approval_keywords)
-
-        return {
-            "url": url,
-            "valid": True,
-            "approval_required": requires_approval,
-            "reason": "OK" if not requires_approval else "Admin Approval Required"
-        }
-
-    except Exception as e:
-        logger.error(f"Error checking {url}: {e}")
-        return {"url": url, "valid": False, "approval_required": False, "reason": "Connection Failed"}
-
-
 async def fetch_and_extract_from_url(client: httpx.AsyncClient, website_url: str) -> list[str]:
-    """Fetches HTML from a website URL and extracts all embedded WhatsApp links (Original Working Method)."""
+    """Fetches HTML from a website URL and extracts all embedded WhatsApp links."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -291,32 +351,49 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def process_and_validate_links(status_message, links: list[str], context: ContextTypes.DEFAULT_TYPE):
-    """Validates links, displays live progress, outputs strict numbered format, and loops action buttons."""
+    """Validates links using bounded concurrency[span_2](start_span)[span_2](end_span), displays live progress, outputs strict numbered format, and loops action buttons."""
     total_links = len(links)
     valid_instant_join_links = []
     
-    async with httpx.AsyncClient(verify=False) as client:
-        for idx, link in enumerate(links, start=1):
-            res = await validate_wa_link(client, link)
-            
-            if res["valid"] and not res["approval_required"]:
-                valid_instant_join_links.append(link)
+    concurrency = 3
+    sem = asyncio.Semaphore(concurrency)
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+    
+    completed_count = 0
 
-            if idx % 5 == 0 or idx == total_links:
-                progress_bar = f"[{'█' * int(idx / total_links * 10)}{'░' * (10 - int(idx / total_links * 10))}]"
-                await status_message.edit_text(
-                    f"⚡ **Validating Links...**\n\n"
-                    f"Progress: `{progress_bar}` **{idx}/{total_links}** ({int(idx/total_links*100)}%)\n"
-                    f"✅ **Instant-Join Active:** {len(valid_instant_join_links)}",
-                    parse_mode="Markdown"
-                )
-            await asyncio.sleep(0.3)
+    async with httpx.AsyncClient(limits=limits, http2=False, verify=False) as client:
+        async def validate_single(link):
+            nonlocal completed_count
+            async with sem:
+                res = await validate_wa_link(client, link)
+                await asyncio.sleep(random.uniform(0.4, 1.2))  # pacing between requests[span_3](start_span)[span_3](end_span)
+                completed_count += 1
+                
+                # Consider active and non-admin-approval as instant-join
+                is_instant = (res["status"] == "active" and res["valid"] and not res["approval_required"])
+                if is_instant:
+                    valid_instant_join_links.append(link)
 
+                if completed_count % 3 == 0 or completed_count == total_links:
+                    progress_bar = f"[{'█' * int(completed_count / total_links * 10)}{'░' * (10 - int(completed_count / total_links * 10))}]"
+                    try:
+                        await status_message.edit_text(
+                            f"⚡ **Validating Links...**\n\n"
+                            f"Progress: `{progress_bar}` **{completed_count}/{total_links}** ({int(completed_count/total_links*100)}%)\n"
+                            f"✅ **Instant-Join Active:** {len(valid_instant_join_links)}",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*(validate_single(link) for link in links))
+
+    # Final completion update
     await status_message.edit_text(
         f"✅ **Validation Complete!**\n\n"
         f"📊 **Total Links Scanned:** {total_links}\n"
         f"🚀 **Instant-Join (No Admin Approval):** {len(valid_instant_join_links)}\n"
-        f"❌ **Filtered Out (Invalid/Admin Needed):** {total_links - len(valid_instant_join_links)}",
+        f"❌ **Filtered Out (Invalid/Admin Needed/Unknown):** {total_links - len(valid_instant_join_links)}",
         parse_mode="Markdown"
     )
 
@@ -357,6 +434,7 @@ async def process_and_validate_links(status_message, links: list[str], context: 
 # ==========================================
 
 def main():
+    """Starts the bot application with an explicit event loop for Python 3.14+."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
