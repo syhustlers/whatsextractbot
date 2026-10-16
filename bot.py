@@ -49,9 +49,7 @@ from telegram.ext import (
 # Configuration
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = (
-    os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
-).strip()
+BOT_TOKEN = "8962511038:AAFvS1LZYYHwjIqVAh3Kx48irYntMcb9Y-Q"
 
 HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
