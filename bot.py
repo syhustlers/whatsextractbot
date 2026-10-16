@@ -3,7 +3,6 @@ import re
 import asyncio
 import logging
 import httpx
-import html
 from bs4 import BeautifulSoup
 from io import BytesIO
 import threading
@@ -69,11 +68,8 @@ STATE_AWAITING_LINKS = 2
 # ==========================================
 
 def extract_wa_links(text: str) -> list[str]:
-    """Extracts unique, normalized WhatsApp invite links from text, handling HTML entities."""
-    if not text:
-        return []
-    cleaned_text = html.unescape(text)
-    matches = WA_LINK_REGEX.findall(cleaned_text)
+    """Extracts unique, normalized WhatsApp invite links from text."""
+    matches = WA_LINK_REGEX.findall(text)
     unique_links = []
     seen = set()
     for code in matches:
@@ -84,7 +80,7 @@ def extract_wa_links(text: str) -> list[str]:
 
 
 async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    """Bulletproof validation using WhatsApp preview crawler headers and comprehensive keywords."""
+    """Robustly checks WhatsApp link status using WhatsApp's preview crawler headers."""
     headers = {
         "User-Agent": "WhatsApp/2.23.2.74 A",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -151,33 +147,21 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
 
 
 async def fetch_and_extract_from_url(client: httpx.AsyncClient, website_url: str) -> list[str]:
-    """Dual-method extraction: Scans <a> href tags AND raw HTML text to guarantee zero missed links."""
+    """Fetches HTML from a website URL and extracts all embedded WhatsApp links (Original Working Method)."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
     try:
         if not website_url.startswith(("http://", "https://")):
             website_url = "https://" + website_url
             
-        res = await client.get(website_url, headers=headers, follow_redirects=True, timeout=15.0)
+        res = await client.get(website_url, headers=headers, follow_redirects=True, timeout=12.0)
         if res.status_code == 200:
-            html_content = res.text
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            found_links = set()
-            
-            # Method 1: Search all <a> tag href attributes
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                if 'chat.whatsapp.com' in href:
-                    found_links.update(extract_wa_links(href))
-                    
-            # Method 2: Search raw HTML content via regex
-            found_links.update(extract_wa_links(html_content))
-            
-            return list(found_links)
+            return extract_wa_links(res.text)
     except Exception as e:
         logger.error(f"Failed to fetch site {website_url}: {e}")
     return []
@@ -307,7 +291,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def process_and_validate_links(status_message, links: list[str], context: ContextTypes.DEFAULT_TYPE):
-    """Validates links, displays live progress updates, outputs strict numbered lists + .txt file backup, and loops buttons."""
+    """Validates links, displays live progress, outputs strict numbered format, and loops action buttons."""
     total_links = len(links)
     valid_instant_join_links = []
     
@@ -344,6 +328,7 @@ async def process_and_validate_links(status_message, links: list[str], context: 
         )
         return
 
+    # Strict numbered list format (1. Link, 2. Link, etc.)
     numbered_links = [f"{i}. {link}" for i, link in enumerate(valid_instant_join_links, 1)]
     raw_output_text = "\n".join(numbered_links)
     
@@ -393,4 +378,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
