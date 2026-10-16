@@ -1,390 +1,1019 @@
-import os
-import re
-import asyncio
-import logging
-import random
-import httpx
-import html
-from bs4 import BeautifulSoup
-from io import BytesIO
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+"""
+WhatsApp Group Link Scraper & Validator - Telegram bot for Render.
 
+Environment variables:
+    BOT_TOKEN  (required)  Telegram bot token from @BotFather
+    PORT       (optional)  Health check port, defaults to 10000
+
+Dependencies:
+    python-telegram-bot==21.1.1
+    httpx==0.27.0
+    beautifulsoup4==4.12.3
+"""
+
+import asyncio
+import html
+import io
+import logging
+import os
+import random
+import re
+import sys
+import threading
+import time
+from collections import Counter
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import unquote, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Update,
 )
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# Configure logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 
-# ==========================================
-# RENDER HEALTH CHECK SERVER (Prevents Port Crash)
-# ==========================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Telegram Bot is active and running!")
-    def log_message(self, format, *args):
-        pass
+BOT_TOKEN = (
+    os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+).strip()
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Render health check server bound to port {port}")
-    server.serve_forever()
+HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
-threading.Thread(target=run_health_server, daemon=True).start()
+BTN_SCRAPE = "btn_scrape"
+BTN_VALIDATE_LIST = "btn_validate_list"
 
-# Bot Token
-BOT_TOKEN = "8962511038:AAFvS1LZYYHwjIqVAh3Kx48irYntMcb9Y-Q"
+STATE_AWAITING_WEBSITES = "awaiting_websites"
+STATE_AWAITING_LINKS = "awaiting_links"
 
-# User state constants
-STATE_NONE = 0
-STATE_AWAITING_WEBSITES = 1
-STATE_AWAITING_LINKS = 2
+STATUS_VALID = "valid"
+STATUS_DEAD = "dead"
+STATUS_APPROVAL = "approval"
+STATUS_UNKNOWN = "unknown"
 
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
+MAX_WEBSITES = 100
+MAX_LINKS = 2000
 
-# ==========================================
-# FAST & SECURE WA VALIDATOR ENGINE
-# ==========================================
-CODE_RE = re.compile(r"chat\.whatsapp\.com/(?:invite/)?([A-Za-z0-9_-]{20,24})", re.I)
+SCRAPE_CONCURRENCY = 5
+VALIDATE_CONCURRENCY = 5
 
-HEADERS = {
+REQUEST_TIMEOUT_SECONDS = 5.0
+REQUEST_DEADLINE_SECONDS = 8.0
+SITE_DEADLINE_SECONDS = 20.0
+LINK_DEADLINE_SECONDS = 35.0
+MAX_VALIDATION_ATTEMPTS = 3
+MAX_PAGE_BYTES = 3 * 1024 * 1024
+MAX_INVITE_PAGE_BYTES = 1024 * 1024
+
+RATE_LIMIT_STATUSES = {403, 429, 503}
+DEAD_STATUSES = {400, 404, 410}
+
+PROGRESS_INTERVAL_SECONDS = 2.5
+TELEGRAM_CHUNK_LIMIT = 3800
+OUTPUT_FILENAME = "valid_whatsapp_groups.txt"
+
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
 }
 
-GENERIC_TITLES = {"", "whatsapp", "whatsapp group invite", "whatsapp web", "whatsapp messenger"}
-
-DEAD_PHRASES = (
-    "invite link was reset", "invite link is invalid", "invite link has been revoked",
-    "invite link is no longer valid", "couldn't find group", "could not find group",
-    "link has expired", "group doesn't exist", "no longer available",
+WHATSAPP_CODE_RE = re.compile(
+    r"chat\.whatsapp\.com/(?:invite/)?([A-Za-z0-9]{22})", re.IGNORECASE
 )
-APPROVAL_PHRASES = (
-    "request to join", "admin must approve", "admins must approve",
-    "approve your request", "approval required", "pending approval",
+URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+", re.IGNORECASE)
+DOMAIN_RE = re.compile(r"^[\w.-]+\.[A-Za-z]{2,}(?:[:/?#]\S*)?$")
+
+GENERIC_TITLES = {
+    "whatsapp",
+    "whatsapp group invite",
+    "whatsapp group",
+    "whatsapp web",
+    "whatsapp messenger",
+}
+
+DEAD_MARKERS = (
+    "invite link is invalid",
+    "link is invalid",
+    "invite link was reset",
+    "link was reset",
+    "link has been reset",
+    "has been reset",
+    "been revoked",
+    "was revoked",
+    "link is revoked",
+    "link has expired",
+    "link is expired",
+    "invite link expired",
+    "no longer valid",
+    "no longer active",
+    "link is no longer",
 )
 
+APPROVAL_MARKERS = (
+    "request to join",
+    "requests to join",
+    "admin must approve",
+    "admins must approve",
+    "admin approval",
+    "admins approval",
+    "approval required",
+    "requires approval",
+    "require approval",
+    "approve new members",
+    "approve before",
+    "join request",
+    "needs admin approval",
+)
 
-def _result(url, valid, approval, reason, status):
-    return {"url": url, "valid": valid, "approval_required": approval,
-            "reason": reason, "status": status}
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logger = logging.getLogger("wa-bot")
 
 
-def _meta(soup: BeautifulSoup, prop: str) -> str:
-    tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
-    return (tag.get("content") or "").strip() if tag else ""
+# --------------------------------------------------------------------------- #
+# Render health check server
+# --------------------------------------------------------------------------- #
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Answers every GET/HEAD request with HTTP 200."""
+
+    def _respond(self, include_body: bool) -> None:
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if include_body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._respond(True)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._respond(False)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
 
 
-async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    m = CODE_RE.search(url or "")
-    if not m:
-        return _result(url, False, False, "malformed_link", "dead")
-    canonical = f"https://chat.whatsapp.com/{m.group(1)}"
+def start_health_server() -> None:
+    """Starts the health check HTTP server in a background daemon thread."""
+    server = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(
+        target=server.serve_forever, name="health-server", daemon=True
+    )
+    thread.start()
+    logger.info("Health check server listening on port %s", HEALTH_PORT)
 
+
+# --------------------------------------------------------------------------- #
+# Telegram helpers
+# --------------------------------------------------------------------------- #
+
+def main_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🌐 Scrape & Validate Websites", callback_data=BTN_SCRAPE)],
+            [InlineKeyboardButton("📁 Validate Link List / File", callback_data=BTN_VALIDATE_LIST)],
+        ]
+    )
+
+
+def _retry_seconds(exc: RetryAfter) -> float:
+    value = exc.retry_after
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    return float(value)
+
+
+async def tg_call(factory: Callable[[], Awaitable[Any]], attempts: int = 3) -> Any:
+    """Runs a Telegram API call with flood-wait and network error handling."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            return await factory()
+        except RetryAfter as exc:
+            last_exc = exc
+            await asyncio.sleep(min(_retry_seconds(exc), 30.0) + 1.0)
+        except BadRequest:
+            raise
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            await asyncio.sleep(1.5 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+async def safe_send(bot: Any, chat_id: int, text: str, **kwargs: Any) -> Any:
+    return await tg_call(
+        lambda: bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            link_preview_options=NO_PREVIEW,
+            **kwargs,
+        )
+    )
+
+
+async def safe_send_document(
+    bot: Any, chat_id: int, payload: bytes, filename: str, caption: str
+) -> Any:
+    return await tg_call(
+        lambda: bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(payload),
+            filename=filename,
+            caption=caption,
+        )
+    )
+
+
+class ProgressReporter:
+    """Throttled live progress updates through message editing."""
+
+    def __init__(self, bot: Any, chat_id: int, message_id: Optional[int]) -> None:
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self._last_text = ""
+        self._last_edit = 0.0
+
+    async def update(self, text: str, force: bool = False) -> None:
+        if self.message_id is None or text == self._last_text:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_edit < PROGRESS_INTERVAL_SECONDS:
+            return
+        self._last_edit = now
+        self._last_text = text
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=self.message_id, text=text
+            )
+        except Exception as exc:  # progress is cosmetic and must never break a job
+            logger.debug("Progress update skipped: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers
+# --------------------------------------------------------------------------- #
+
+def decode_bytes(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
     try:
-        # Strict 6-second timeout so it never hangs
-        r = await client.get(canonical, headers=HEADERS, follow_redirects=True, timeout=6.0)
-        
-        if r.status_code in [403, 429, 500, 502, 503, 504]:
-            return _result(canonical, False, False, f"rate_limited_{r.status_code}", "unknown")
-        if r.status_code == 404:
-            return _result(canonical, False, False, "http_404", "dead")
-        if r.status_code != 200:
-            return _result(canonical, False, False, f"unexpected_http_{r.status_code}", "unknown")
-
-        if not str(r.url.host).endswith(("whatsapp.com", "whatsapp.net")):
-            return _result(canonical, False, False, "redirected_off_whatsapp", "unknown")
-
-        html_text = r.text or ""
-        low = html_text.lower()
-        soup = BeautifulSoup(html_text, "html.parser")
-
-        title = _meta(soup, "og:title")
-        image = _meta(soup, "og:image")
-        has_og = bool(title or image or _meta(soup, "og:description"))
-
-        if not has_og and len(html_text) < 300:
-            return _result(canonical, False, False, "masked_response", "unknown")
-
-        visible = soup.get_text(" ", strip=True).lower()
-
-        has_name = title.lower() not in GENERIC_TITLES
-        img_host = re.sub(r"^https?://([^/]+).*$", r"\1", image).lower() if image else ""
-        has_avatar = img_host.endswith("whatsapp.net")
-
-        if not has_name:
-            for p in DEAD_PHRASES:
-                if p in visible:
-                    return _result(canonical, False, False, f"dead_link:'{p}'", "dead")
-            if has_og:
-                return _result(canonical, False, False, "dead_link:generic_fallback_page", "dead")
-            return _result(canonical, False, False, "unrecognised_page", "unknown")
-
-        for p in DEAD_PHRASES:
-            if p in visible:
-                return _result(canonical, False, False, f"dead_link:'{p}'", "dead")
-
-        approval = any(p in visible or p in low for p in APPROVAL_PHRASES)
-        if approval:
-            return _result(canonical, True, True, f"active_group:'{title}' (admin approval wording found)", "active")
-
-        note = "" if has_avatar else ", no_avatar"
-        return _result(canonical, True, False, f"active_group:'{title}'{note}", "active")
-
-    except Exception as e:
-        return _result(canonical, False, False, f"error:{type(e).__name__}", "unknown")
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("latin-1", errors="replace")
 
 
-# ==========================================
-# EXTRACTION HELPERS
-# ==========================================
-def extract_wa_links(text: str) -> list[str]:
+def extract_whatsapp_codes(text: str) -> list[str]:
+    """Returns unique WhatsApp invite codes in order of first appearance."""
     if not text:
         return []
-    cleaned_text = html.unescape(text)
-    matches = CODE_RE.findall(cleaned_text)
-    unique_links = []
-    seen = set()
-    for code in matches:
-        if code not in seen:
-            seen.add(code)
-            unique_links.append(f"https://chat.whatsapp.com/{code}")
-    return unique_links
+    cleaned = html.unescape(text).replace("\\/", "/")
+    haystack = cleaned + "\n" + unquote(cleaned)
+    seen: dict[str, None] = {}
+    for match in WHATSAPP_CODE_RE.finditer(haystack):
+        seen.setdefault(match.group(1), None)
+    return list(seen)
 
 
-async def fetch_and_extract_from_url(client: httpx.AsyncClient, website_url: str) -> list[str]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+def code_to_link(code: str) -> str:
+    return f"https://chat.whatsapp.com/{code}"
+
+
+def parse_website_urls(text: str) -> list[str]:
+    """Parses one-URL-per-line input into a deduplicated list of http(s) URLs."""
+    urls: dict[str, None] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip(",;")
+        if not line or line.startswith("#"):
+            continue
+        candidates = URL_RE.findall(line)
+        if not candidates and DOMAIN_RE.match(line):
+            candidates = [line]
+        for candidate in candidates:
+            candidate = candidate.rstrip(".,;:!?")
+            if not re.match(r"^https?://", candidate, re.IGNORECASE):
+                candidate = "https://" + candidate
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+            if not host or "." not in host:
+                continue
+            if host == "chat.whatsapp.com":
+                continue
+            urls.setdefault(candidate, None)
+    return list(urls)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP engine
+# --------------------------------------------------------------------------- #
+
+class Cooldown:
+    """Shared back-off gate so all workers slow down after a rate limit."""
+
+    def __init__(self) -> None:
+        self.until = 0.0
+
+    def trigger(self, seconds: float) -> None:
+        self.until = max(self.until, time.monotonic() + seconds)
+
+    async def wait(self) -> None:
+        delay = self.until - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(min(delay, 8.0))
+
+
+def build_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers=BROWSER_HEADERS,
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
+        follow_redirects=True,
+        max_redirects=5,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+
+
+async def http_get(
+    client: httpx.AsyncClient, url: str, max_bytes: int
+) -> tuple[int, str, httpx.Headers]:
+    """Streams a GET request, capping the body size, and returns decoded text."""
+    async with client.stream("GET", url) as response:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+        status = response.status_code
+        headers = response.headers
+        encoding = response.encoding or "utf-8"
+    raw = b"".join(chunks)[:max_bytes]
     try:
-        if not website_url.startswith(("http://", "https://")):
-            website_url = "https://" + website_url
-            
-        res = await client.get(website_url, headers=headers, follow_redirects=True, timeout=12.0)
-        if res.status_code == 200:
-            return extract_wa_links(res.text)
-    except Exception as e:
-        logger.error(f"Failed to fetch site {website_url}: {e}")
+        text = raw.decode(encoding, errors="replace")
+    except LookupError:
+        text = raw.decode("utf-8", errors="replace")
+    return status, text, headers
+
+
+def retry_delay(headers: httpx.Headers, attempt: int) -> float:
+    retry_after = (headers.get("retry-after") or "").strip()
+    if retry_after.isdigit():
+        return float(min(int(retry_after), 6))
+    return min(1.5 * (attempt + 1) + random.random(), 6.0)
+
+
+# --------------------------------------------------------------------------- #
+# Website scraping engine
+# --------------------------------------------------------------------------- #
+
+async def scrape_site(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    cooldown: Cooldown,
+    url: str,
+) -> list[str]:
+    for attempt in range(2):
+        await cooldown.wait()
+        try:
+            async with sem:
+                status, text, headers = await asyncio.wait_for(
+                    http_get(client, url, MAX_PAGE_BYTES), SITE_DEADLINE_SECONDS
+                )
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+        except Exception as exc:
+            logger.info("Scrape failed for %s: %s", url, exc.__class__.__name__)
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            return []
+        if status in RATE_LIMIT_STATUSES:
+            cooldown.trigger(retry_delay(headers, attempt))
+            continue
+        if status >= 400:
+            return []
+        return extract_whatsapp_codes(text)
     return []
 
 
-# ==========================================
-# BOT TELEGRAM HANDLERS
-# ==========================================
+async def scrape_all(
+    client: httpx.AsyncClient,
+    urls: list[str],
+    direct_codes: list[str],
+    progress: ProgressReporter,
+) -> list[str]:
+    sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
+    cooldown = Cooldown()
+    per_site: list[list[str]] = [[] for _ in urls]
+    state = {"done": 0, "failed": 0}
+    total = len(urls)
 
-def get_main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("🌐 Scrape & Validate Websites", callback_data="btn_scrape")],
-        [InlineKeyboardButton("📁 Validate Link List / File", callback_data="btn_validate_list")]
+    def current_found() -> int:
+        unique = set(direct_codes)
+        for codes in per_site:
+            unique.update(codes)
+        return len(unique)
+
+    async def worker(index: int, url: str) -> None:
+        try:
+            per_site[index] = await scrape_site(client, sem, cooldown, url)
+        except Exception as exc:
+            logger.warning("Scrape worker error for %s: %s", url, exc)
+            per_site[index] = []
+        state["done"] += 1
+        await progress.update(
+            f"🔎 Scraping websites: {state['done']}/{total}\n"
+            f"🔗 Unique links found so far: {current_found()}",
+            force=state["done"] == total,
+        )
+
+    tasks = [asyncio.create_task(worker(i, u)) for i, u in enumerate(urls)]
+    try:
+        if tasks:
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    merged: dict[str, None] = {}
+    for code in direct_codes:
+        merged.setdefault(code, None)
+    for codes in per_site:
+        for code in codes:
+            merged.setdefault(code, None)
+    return list(merged)
+
+
+# --------------------------------------------------------------------------- #
+# Link validation engine
+# --------------------------------------------------------------------------- #
+
+def _meta_content(soup: BeautifulSoup, prop: str) -> str:
+    tag = soup.find("meta", attrs={"property": prop}) or soup.find(
+        "meta", attrs={"name": prop}
+    )
+    if tag is None:
+        return ""
+    content = tag.get("content")
+    return str(content).strip() if content else ""
+
+
+def classify_invite_page(page: str) -> str:
+    """Classifies a WhatsApp invite page as valid, dead, approval or unknown."""
+    if len(page.strip()) < 200:
+        return STATUS_UNKNOWN
+
+    soup = BeautifulSoup(page, "html.parser")
+    title = _meta_content(soup, "og:title")
+    image = _meta_content(soup, "og:image")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    body = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).lower()
+    haystack = f"{title.lower()} {body}"
+
+    if any(marker in haystack for marker in DEAD_MARKERS):
+        return STATUS_DEAD
+
+    if not title and not image:
+        return STATUS_UNKNOWN
+
+    has_group_name = bool(title) and title.strip().lower() not in GENERIC_TITLES
+    has_group_image = "pps.whatsapp.net" in image.lower()
+    if not (has_group_name or has_group_image):
+        return STATUS_DEAD
+
+    if any(marker in haystack for marker in APPROVAL_MARKERS):
+        return STATUS_APPROVAL
+
+    return STATUS_VALID
+
+
+async def validate_code(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    cooldown: Cooldown,
+    code: str,
+) -> str:
+    url = code_to_link(code)
+    for attempt in range(MAX_VALIDATION_ATTEMPTS):
+        await cooldown.wait()
+        try:
+            async with sem:
+                status, text, headers = await asyncio.wait_for(
+                    http_get(client, url, MAX_INVITE_PAGE_BYTES),
+                    REQUEST_DEADLINE_SECONDS,
+                )
+                await asyncio.sleep(random.uniform(0.15, 0.4))
+        except Exception as exc:
+            logger.debug("Validation request error for %s: %s", code, exc.__class__.__name__)
+            await asyncio.sleep(0.8 * (attempt + 1))
+            continue
+
+        if status in RATE_LIMIT_STATUSES:
+            cooldown.trigger(retry_delay(headers, attempt))
+            continue
+        if status in DEAD_STATUSES:
+            return STATUS_DEAD
+        if status != 200:
+            await asyncio.sleep(0.8 * (attempt + 1))
+            continue
+
+        result = classify_invite_page(text)
+        if result != STATUS_UNKNOWN:
+            return result
+        await asyncio.sleep(0.8 * (attempt + 1))
+    return STATUS_UNKNOWN
+
+
+def _validation_progress_text(done: int, total: int, counts: Counter) -> str:
+    return (
+        f"🧪 Validating links: {done}/{total}\n"
+        f"✅ Instant-join: {counts[STATUS_VALID]}\n"
+        f"⛔ Dead/expired: {counts[STATUS_DEAD]}\n"
+        f"🔒 Admin approval: {counts[STATUS_APPROVAL]}\n"
+        f"⚠️ Unverified: {counts[STATUS_UNKNOWN]}"
+    )
+
+
+async def validate_all(
+    client: httpx.AsyncClient,
+    codes: list[str],
+    progress: ProgressReporter,
+) -> dict[str, str]:
+    sem = asyncio.Semaphore(VALIDATE_CONCURRENCY)
+    cooldown = Cooldown()
+    statuses: dict[str, str] = {}
+    counts: Counter = Counter()
+    total = len(codes)
+
+    async def worker(code: str) -> None:
+        try:
+            status = await asyncio.wait_for(
+                validate_code(client, sem, cooldown, code), LINK_DEADLINE_SECONDS
+            )
+        except Exception as exc:
+            logger.debug("Validation worker error for %s: %s", code, exc.__class__.__name__)
+            status = STATUS_UNKNOWN
+        statuses[code] = status
+        counts[status] += 1
+        done = len(statuses)
+        await progress.update(
+            _validation_progress_text(done, total, counts), force=done == total
+        )
+
+    tasks = [asyncio.create_task(worker(code)) for code in codes]
+    try:
+        if tasks:
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+    return statuses
+
+
+# --------------------------------------------------------------------------- #
+# Output delivery
+# --------------------------------------------------------------------------- #
+
+def chunk_numbered_lines(lines: list[str], limit: int = TELEGRAM_CHUNK_LIMIT) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        added = len(line) + (1 if current else 0)
+        if current and current_len + added > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += added
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def deliver_results(
+    bot: Any,
+    chat_id: int,
+    ordered_codes: list[str],
+    statuses: dict[str, str],
+    note: str,
+) -> None:
+    counts = Counter(statuses.get(code, STATUS_UNKNOWN) for code in ordered_codes)
+    valid_links = [
+        code_to_link(code)
+        for code in ordered_codes
+        if statuses.get(code) == STATUS_VALID
     ]
-    return InlineKeyboardMarkup(keyboard)
+
+    summary = (
+        f"🔍 Links checked: {len(ordered_codes)}\n"
+        f"✅ Instant-join: {counts[STATUS_VALID]}\n"
+        f"⛔ Dead/expired/reset: {counts[STATUS_DEAD]}\n"
+        f"🔒 Admin approval required: {counts[STATUS_APPROVAL]}\n"
+        f"⚠️ Could not verify (rate-limited/timeouts): {counts[STATUS_UNKNOWN]}"
+    )
+    if note:
+        summary += f"\n\n{note}"
+
+    if not valid_links:
+        await safe_send(
+            bot,
+            chat_id,
+            "😕 No verified instant-join WhatsApp group links were found.\n\n"
+            f"{summary}\n\nChoose what to do next:",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    numbered = [f"{index}. {link}" for index, link in enumerate(valid_links, start=1)]
+    for chunk in chunk_numbered_lines(numbered):
+        await safe_send(bot, chat_id, chunk)
+        await asyncio.sleep(0.3)
+
+    payload = ("\n".join(numbered) + "\n").encode("utf-8")
+    await safe_send_document(
+        bot,
+        chat_id,
+        payload,
+        OUTPUT_FILENAME,
+        f"📎 Backup file: {len(valid_links)} verified instant-join links",
+    )
+
+    await safe_send(
+        bot,
+        chat_id,
+        f"✅ Finished!\n\n{summary}\n\nChoose what to do next:",
+        reply_markup=main_menu_markup(),
+    )
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["state"] = STATE_NONE
-    welcome_text = "⚡ **WhatsApp Group Validator & Scraper Bot** ⚡\n\nChoose an option below to start:"
-    
-    if update.message:
-        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+# --------------------------------------------------------------------------- #
+# Background job
+# --------------------------------------------------------------------------- #
+
+async def run_job(
+    bot: Any,
+    chat_id: int,
+    user_data: dict,
+    mode: str,
+    urls: list[str],
+    codes: list[str],
+) -> None:
+    try:
+        start_text = (
+            "⏳ Starting website scraping..."
+            if mode == STATE_AWAITING_WEBSITES
+            else "⏳ Starting link validation..."
+        )
+        status_message = await safe_send(bot, chat_id, start_text)
+        progress = ProgressReporter(
+            bot, chat_id, status_message.message_id if status_message else None
+        )
+
+        note = ""
+        async with build_client() as client:
+            if mode == STATE_AWAITING_WEBSITES:
+                all_codes = await scrape_all(client, urls, codes, progress)
+            else:
+                all_codes = list(codes)
+
+            if len(all_codes) > MAX_LINKS:
+                all_codes = all_codes[:MAX_LINKS]
+                note = f"ℹ️ Only the first {MAX_LINKS} links were checked."
+
+            if not all_codes:
+                await progress.update("ℹ️ No WhatsApp group links were found.", force=True)
+                await safe_send(
+                    bot,
+                    chat_id,
+                    "😕 I couldn't find any WhatsApp group invite links.\n\n"
+                    "Choose what to do next:",
+                    reply_markup=main_menu_markup(),
+                )
+                return
+
+            statuses = await validate_all(client, all_codes, progress)
+
+        await progress.update(
+            f"✅ Finished checking {len(all_codes)} links. Sending results...",
+            force=True,
+        )
+        await deliver_results(bot, chat_id, all_codes, statuses, note)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Job failed for chat %s", chat_id)
+        try:
+            await safe_send(
+                bot,
+                chat_id,
+                "❌ Something went wrong while processing your batch. "
+                "Please try again.",
+                reply_markup=main_menu_markup(),
+            )
+        except Exception:
+            logger.exception("Could not send failure notice to chat %s", chat_id)
+    finally:
+        user_data["busy"] = False
 
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --------------------------------------------------------------------------- #
+# Telegram handlers
+# --------------------------------------------------------------------------- #
+
+WELCOME_TEXT = (
+    "👋 Welcome to the WhatsApp Group Link Bot!\n\n"
+    "I can scrape websites for WhatsApp group invite links, or validate links "
+    "you already have, and return only the groups you can join instantly "
+    "(no dead links, no admin approval).\n\n"
+    "Choose an option below:"
+)
+
+BUSY_TEXT = "⏳ I'm still working on your previous batch. Please wait until it finishes."
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    if not context.user_data.get("busy"):
+        context.user_data["state"] = None
+    await safe_send(
+        context.bot, chat.id, WELCOME_TEXT, reply_markup=main_menu_markup()
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    if context.user_data.get("busy"):
+        await safe_send(context.bot, chat.id, BUSY_TEXT)
+        return
+    context.user_data["state"] = None
+    await safe_send(
+        context.bot,
+        chat.id,
+        "🛑 Cancelled. Choose an option:",
+        reply_markup=main_menu_markup(),
+    )
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    chat = update.effective_chat
+    if query is None or chat is None:
+        return
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
 
-    if query.data == "btn_scrape":
+    if context.user_data.get("busy"):
+        await safe_send(context.bot, chat.id, BUSY_TEXT)
+        return
+
+    if query.data == BTN_SCRAPE:
         context.user_data["state"] = STATE_AWAITING_WEBSITES
-        await query.message.reply_text(
-            "🌐 **Scrape & Validate Websites Mode Active**\n\nPlease send or paste your list of target website URLs below (one URL per line).",
-            parse_mode="Markdown"
+        await safe_send(
+            context.bot,
+            chat.id,
+            "🌐 Website mode\n\n"
+            "Send me the website URLs (one per line), or upload a .txt file "
+            "containing one URL per line.",
         )
-    elif query.data == "btn_validate_list":
+    elif query.data == BTN_VALIDATE_LIST:
         context.user_data["state"] = STATE_AWAITING_LINKS
-        await query.message.reply_text(
-            "📁 **Validate Link List Mode Active**\n\nPlease upload your `.txt` file containing WhatsApp group links or paste the raw list directly in chat.",
-            parse_mode="Markdown"
+        await safe_send(
+            context.bot,
+            chat.id,
+            "📁 Link validation mode\n\n"
+            "Send me your WhatsApp group links (one per line, or pasted text), "
+            "or upload a .txt file containing them.",
         )
 
 
-async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("state", STATE_NONE)
+async def handle_user_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    user_data = context.user_data
+    bot = context.bot
+
+    if user_data.get("busy"):
+        await safe_send(bot, chat.id, BUSY_TEXT)
+        return
+
+    state = user_data.get("state")
+    if state not in (STATE_AWAITING_WEBSITES, STATE_AWAITING_LINKS):
+        await safe_send(
+            bot,
+            chat.id,
+            "Please choose an option first:",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    urls: list[str] = []
+    codes: list[str] = []
+    note = ""
 
     if state == STATE_AWAITING_WEBSITES:
-        context.user_data["state"] = STATE_NONE
-        urls = [line.strip() for line in update.message.text.splitlines() if line.strip()]
-        
-        if not urls:
-            await update.message.reply_text("❌ No valid URLs provided. Press /start to try again.")
+        codes = extract_whatsapp_codes(text)
+        urls = parse_website_urls(text)
+        if not urls and not codes:
+            await safe_send(
+                bot,
+                chat.id,
+                "⚠️ I couldn't find any valid website URLs. "
+                "Please send them one per line (for example: https://example.com).",
+            )
             return
-            
-        progress_msg = await update.message.reply_text(f"🔍 **Scraping {len(urls)} website(s)...**", parse_mode="Markdown")
-        
-        extracted_links = set()
-        async with httpx.AsyncClient(verify=False) as client:
-            for idx, site in enumerate(urls, start=1):
-                links = await fetch_and_extract_from_url(client, site)
-                extracted_links.update(links)
-                if idx % 2 == 0 or idx == len(urls):
-                    await progress_msg.edit_text(
-                        f"🌐 Scraped **{idx}/{len(urls)}** websites...\n🔗 Extracted **{len(extracted_links)}** unique WhatsApp links so far.",
-                        parse_mode="Markdown"
-                    )
-
-        if not extracted_links:
-            await progress_msg.edit_text("❌ No WhatsApp group links found on the provided websites.", reply_markup=get_main_menu_keyboard())
+        if len(urls) > MAX_WEBSITES:
+            urls = urls[:MAX_WEBSITES]
+            note = f"\nℹ️ Only the first {MAX_WEBSITES} websites will be scraped."
+        await safe_send(
+            bot,
+            chat.id,
+            f"📥 Received {len(urls)} website(s). Working on it...{note}",
+        )
+    else:
+        codes = extract_whatsapp_codes(text)
+        if not codes:
+            await safe_send(
+                bot,
+                chat.id,
+                "⚠️ I couldn't find any WhatsApp group links "
+                "(https://chat.whatsapp.com/...). Please try again.",
+            )
             return
+        await safe_send(
+            bot, chat.id, f"📥 Received {len(codes)} unique link(s). Working on it..."
+        )
 
-        await process_and_validate_links(progress_msg, list(extracted_links), context)
-
-    elif state == STATE_AWAITING_LINKS or state == STATE_NONE:
-        context.user_data["state"] = STATE_NONE
-        extracted_links = extract_wa_links(update.message.text)
-        
-        if not extracted_links:
-            await update.message.reply_text("❌ No valid WhatsApp group links detected. Send /start to begin.", reply_markup=get_main_menu_keyboard())
-            return
-
-        progress_msg = await update.message.reply_text(f"⚡ Detected **{len(extracted_links)}** unique links. Initializing validation...", parse_mode="Markdown")
-        await process_and_validate_links(progress_msg, extracted_links, context)
-
-
-async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name.endswith(".txt"):
-        await update.message.reply_text("❌ Please upload a valid `.txt` text file.")
-        return
-
-    progress_msg = await update.message.reply_text("📥 Reading uploaded file...", parse_mode="Markdown")
-    
-    file_obj = await context.bot.get_file(doc.file_id)
-    file_bytes = await file_obj.download_as_bytearray()
-    text_content = file_bytes.decode("utf-8", errors="ignore")
-
-    extracted_links = extract_wa_links(text_content)
-    if not extracted_links:
-        await progress_msg.edit_text("❌ No valid WhatsApp group links found inside the uploaded `.txt` file.", reply_markup=get_main_menu_keyboard())
-        return
-
-    await progress_msg.edit_text(f"⚡ Extracted **{len(extracted_links)}** unique links from file. Initializing validation...", parse_mode="Markdown")
-    await process_and_validate_links(progress_msg, extracted_links, context)
-
-
-async def process_and_validate_links(status_message, links: list[str], context: ContextTypes.DEFAULT_TYPE):
-    total_links = len(links)
-    valid_instant_join_links = []
-    
-    concurrency = 5  # Increased concurrency for faster processing
-    sem = asyncio.Semaphore(concurrency)
-    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    
-    completed_count = 0
-
-    async with httpx.AsyncClient(limits=limits, http2=False, verify=False) as client:
-        async def validate_single(link):
-            nonlocal completed_count
-            async with sem:
-                res = await validate_wa_link(client, link)
-                completed_count += 1
-                
-                is_instant = (res["status"] == "active" and res["valid"] and not res["approval_required"])
-                if is_instant:
-                    valid_instant_join_links.append(link)
-
-                if completed_count % 3 == 0 or completed_count == total_links:
-                    progress_bar = f"[{'█' * int(completed_count / total_links * 10)}{'░' * (10 - int(completed_count / total_links * 10))}]"
-                    try:
-                        await status_message.edit_text(
-                            f"⚡ **Validating Links...**\n\n"
-                            f"Progress: `{progress_bar}` **{completed_count}/{total_links}** ({int(completed_count/total_links*100)}%)\n"
-                            f"✅ **Instant-Join Active:** {len(valid_instant_join_links)}",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-
-        await asyncio.gather(*(validate_single(link) for link in links))
-
-    await status_message.edit_text(
-        f"✅ **Validation Complete!**\n\n"
-        f"📊 **Total Links Scanned:** {total_links}\n"
-        f"🚀 **Instant-Join (No Admin Approval):** {len(valid_instant_join_links)}\n"
-        f"❌ **Filtered Out (Invalid/Admin Needed/Unknown):** {total_links - len(valid_instant_join_links)}",
-        parse_mode="Markdown"
+    user_data["busy"] = True
+    user_data["state"] = None
+    context.application.create_task(
+        run_job(bot, chat.id, user_data, state, urls, codes)
     )
 
-    if not valid_instant_join_links:
-        await status_message.reply_text(
-            "⚠️ No free-to-join active WhatsApp groups were found in this batch.\n\nWould you like to validate another batch or check more websites?",
-            reply_markup=get_main_menu_keyboard()
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    await handle_user_input(update, context, message.text)
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or message.document is None or chat is None:
+        return
+
+    if context.user_data.get("busy"):
+        await safe_send(context.bot, chat.id, BUSY_TEXT)
+        return
+
+    if context.user_data.get("state") not in (
+        STATE_AWAITING_WEBSITES,
+        STATE_AWAITING_LINKS,
+    ):
+        await safe_send(
+            context.bot,
+            chat.id,
+            "Please choose an option first:",
+            reply_markup=main_menu_markup(),
         )
         return
 
-    numbered_links = [f"{i}. {link}" for i, link in enumerate(valid_instant_join_links, 1)]
-    raw_output_text = "\n".join(numbered_links)
-    
-    await status_message.reply_text("👇 **Here are your numbered instant-join valid WhatsApp group links:**")
-    
-    max_chars = 3800
-    for i in range(0, len(raw_output_text), max_chars):
-        chunk = raw_output_text[i:i + max_chars]
-        await status_message.reply_text(chunk, disable_web_page_preview=True)
+    document = message.document
+    file_name = (document.file_name or "").lower()
+    if not (file_name.endswith(".txt") or document.mime_type == "text/plain"):
+        await safe_send(context.bot, chat.id, "⚠️ Please upload a plain .txt file.")
+        return
+    if document.file_size and document.file_size > MAX_TEXT_FILE_BYTES:
+        await safe_send(
+            context.bot,
+            chat.id,
+            f"⚠️ That file is too large. The limit is {MAX_TEXT_FILE_BYTES // (1024 * 1024)} MB.",
+        )
+        return
 
-    file_bytes = BytesIO(raw_output_text.encode("utf-8"))
-    file_bytes.name = "valid_whatsapp_groups.txt"
-    
-    await context.bot.send_document(
-        chat_id=status_message.chat_id,
-        document=file_bytes,
-        filename="valid_whatsapp_groups.txt",
-        caption="📄 **Downloadable `.txt` export of verified instant-join links.**\n\n🔄 **Want to validate more? Choose an option below:**",
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode="Markdown"
+    try:
+        telegram_file = await tg_call(lambda: document.get_file())
+        data = await tg_call(lambda: telegram_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download document for chat %s", chat.id)
+        await safe_send(
+            context.bot,
+            chat.id,
+            "❌ I couldn't download that file. Please try uploading it again.",
+        )
+        return
+
+    await handle_user_input(update, context, decode_bytes(bytes(data)))
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    if not BOT_TOKEN:
+        logger.critical("BOT_TOKEN environment variable is not set. Exiting.")
+        sys.exit(1)
+
+    start_health_server()
+
+    # Python 3.14 no longer creates an implicit event loop, so create one explicitly.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(15)
+        .get_updates_connect_timeout(15)
+        .get_updates_read_timeout(30)
+        .get_updates_pool_timeout(15)
+        .build()
     )
 
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(
+        CallbackQueryHandler(menu_callback, pattern=f"^({BTN_SCRAPE}|{BTN_VALIDATE_LIST})$")
+    )
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application.add_error_handler(error_handler)
 
-def main():
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
-
-    logger.info("Bot started successfully and polling...")
-    app.run_polling()
+    logger.info("Bot is starting polling...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
     main()
-            
