@@ -1,6 +1,6 @@
 """
 WhatsApp Group Link Scraper & Validator - Telegram bot for Render.
-Includes Multi-Key ScraperAPI Rotation & Failover Engine.
+Includes Multi-Key ScraperAPI Rotation & Failover Engine with Pacing.
 """
 
 import asyncio
@@ -70,8 +70,9 @@ MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 MAX_WEBSITES = 100
 MAX_LINKS = 2000
 
-SCRAPE_CONCURRENCY = 5
-VALIDATE_CONCURRENCY = 5
+# Lowered concurrency to respect ScraperAPI free tier limits and prevent throttling
+SCRAPE_CONCURRENCY = 2
+VALIDATE_CONCURRENCY = 2
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 REQUEST_DEADLINE_SECONDS = 8.0
@@ -586,10 +587,11 @@ async def validate_code(
                     http_get(client, url, MAX_INVITE_PAGE_BYTES),
                     REQUEST_DEADLINE_SECONDS,
                 )
-                await asyncio.sleep(random.uniform(0.15, 0.4))
+                # Gentle pacing delay to prevent ScraperAPI rate limits
+                await asyncio.sleep(1.0)
         except Exception as exc:
             logger.debug("Validation request error for %s: %s", code, exc.__class__.__name__)
-            await asyncio.sleep(0.8 * (attempt + 1))
+            await asyncio.sleep(1.5 * (attempt + 1))
             continue
 
         if status in RATE_LIMIT_STATUSES:
