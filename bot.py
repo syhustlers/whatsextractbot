@@ -1,14 +1,6 @@
 """
 WhatsApp Group Link Scraper & Validator - Telegram bot for Render.
-
-Environment variables:
-    BOT_TOKEN  (required)  Telegram bot token from @BotFather
-    PORT       (optional)  Health check port, defaults to 10000
-
-Dependencies:
-    python-telegram-bot==21.1.1
-    httpx==0.27.0
-    beautifulsoup4==4.12.3
+Includes Multi-Key ScraperAPI Rotation & Failover Engine.
 """
 
 import asyncio
@@ -46,10 +38,20 @@ from telegram.ext import (
 )
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# Configuration & Multi-Key ScraperAPI Pool
 # --------------------------------------------------------------------------- #
 
 BOT_TOKEN = "8962511038:AAFvS1LZYYHwjIqVAh3Kx48irYntMcb9Y-Q"
+
+SCRAPER_KEYS = [
+    "7d566c800ca55799d6ec085d8e7c4ff2",
+    "710e8884bfe8116a3618b67640fc09a8",
+    "4b0a93603cff3838c0830d32b47005a2",
+    "233b5663191b1ee77e5fbcb920d468d8",
+    "0e8e3d38b7281b90a0bff5d43c5fe639",
+    "688792c4fe1c11dcedea4fdf6ca0f6a2",
+    "6e8d49f457f68036dd39dd2a1350805a",
+]
 
 HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
@@ -286,7 +288,7 @@ class ProgressReporter:
             await self.bot.edit_message_text(
                 chat_id=self.chat_id, message_id=self.message_id, text=text
             )
-        except Exception as exc:  # progress is cosmetic and must never break a job
+        except Exception as exc:
             logger.debug("Progress update skipped: %s", exc)
 
 
@@ -347,8 +349,27 @@ def parse_website_urls(text: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# HTTP engine
+# Multi-Key Scraper-API Manager with Failover & HTTP Engine
 # --------------------------------------------------------------------------- #
+
+class APIKeyManager:
+    """Manages multiple ScraperAPI keys and rotates automatically on exhaustion/errors."""
+    def __init__(self, keys: list[str]) -> None:
+        self.keys = keys
+        self.index = 0
+        self.lock = asyncio.Lock()
+
+    async def get_key(self) -> str:
+        async with self.lock:
+            return self.keys[self.index]
+
+    async def rotate(self) -> None:
+        async with self.lock:
+            self.index = (self.index + 1) % len(self.keys)
+            logger.warning("🔄 ScraperAPI key capped or blocked. Rotated to key index: %s", self.index)
+
+scraper_key_manager = APIKeyManager(SCRAPER_KEYS)
+
 
 class Cooldown:
     """Shared back-off gate so all workers slow down after a rate limit."""
@@ -378,24 +399,42 @@ def build_client() -> httpx.AsyncClient:
 async def http_get(
     client: httpx.AsyncClient, url: str, max_bytes: int
 ) -> tuple[int, str, httpx.Headers]:
-    """Streams a GET request, capping the body size, and returns decoded text."""
-    async with client.stream("GET", url) as response:
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in response.aiter_bytes():
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_bytes:
-                break
-        status = response.status_code
-        headers = response.headers
-        encoding = response.encoding or "utf-8"
-    raw = b"".join(chunks)[:max_bytes]
-    try:
-        text = raw.decode(encoding, errors="replace")
-    except LookupError:
-        text = raw.decode("utf-8", errors="replace")
-    return status, text, headers
+    """Streams a GET request through ScraperAPI with automatic multi-key failover."""
+    for attempt in range(len(SCRAPER_KEYS)):
+        current_key = await scraper_key_manager.get_key()
+        gateway_url = f"http://api.scraperapi.com?api_key={current_key}&url={url}"
+
+        try:
+            async with client.stream("GET", gateway_url) as response:
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= max_bytes:
+                        break
+                status = response.status_code
+                headers = response.headers
+                encoding = response.encoding or "utf-8"
+
+            if status in {403, 429}:
+                await scraper_key_manager.rotate()
+                continue
+
+            raw = b"".join(chunks)[:max_bytes]
+            try:
+                text = raw.decode(encoding, errors="replace")
+            except LookupError:
+                text = raw.decode("utf-8", errors="replace")
+            return status, text, headers
+
+        except Exception as exc:
+            logger.debug("ScraperAPI request error with key index %s: %s", scraper_key_manager.index, exc)
+            await scraper_key_manager.rotate()
+            if attempt == len(SCRAPER_KEYS) - 1:
+                raise exc
+
+    return 500, "", httpx.Headers()
 
 
 def retry_delay(headers: httpx.Headers, attempt: int) -> float:
@@ -974,12 +1013,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is not set. Exiting.")
+        logger.critical("BOT_TOKEN is not set. Exiting.")
         sys.exit(1)
 
     start_health_server()
 
-    # Python 3.14 no longer creates an implicit event loop, so create one explicitly.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
