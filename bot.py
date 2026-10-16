@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import httpx
+import html
 from bs4 import BeautifulSoup
 from io import BytesIO
 import threading
@@ -68,8 +69,11 @@ STATE_AWAITING_LINKS = 2
 # ==========================================
 
 def extract_wa_links(text: str) -> list[str]:
-    """Extracts unique, normalized WhatsApp invite links from text."""
-    matches = WA_LINK_REGEX.findall(text)
+    """Extracts unique, normalized WhatsApp invite links from text, handling HTML entities."""
+    if not text:
+        return []
+    cleaned_text = html.unescape(text)
+    matches = WA_LINK_REGEX.findall(cleaned_text)
     unique_links = []
     seen = set()
     for code in matches:
@@ -80,10 +84,7 @@ def extract_wa_links(text: str) -> list[str]:
 
 
 async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    """
-    Bulletproof validation using WhatsApp preview crawler user-agent,
-    response integrity checks, and expanded failure/approval signatures.
-    """
+    """Bulletproof validation using WhatsApp preview crawler headers and comprehensive keywords."""
     headers = {
         "User-Agent": "WhatsApp/2.23.2.74 A",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -93,7 +94,6 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
     try:
         response = await client.get(url, headers=headers, follow_redirects=True, timeout=10.0)
         
-        # Response integrity guard: Catch WAF blocks, rate-limits, or cloud IP bans (429, 403, 503)
         if response.status_code in [429, 403, 503, 500]:
             return {"url": url, "valid": False, "approval_required": False, "reason": "Rate Limited / Blocked"}
         
@@ -103,7 +103,6 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
         html_text = response.text
         soup = BeautifulSoup(html_text, 'html.parser')
         
-        # Extract Open Graph metadata tags rendered by WhatsApp servers
         og_desc = ""
         og_title = ""
         meta_desc = soup.find("meta", property="og:description")
@@ -115,7 +114,6 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
 
         combined_text = f"{html_text} {og_desc} {og_title}".lower()
         
-        # Expanded invalid/reset keyword signatures
         invalid_keywords = [
             "invite link is invalid",
             "reset invite link",
@@ -129,7 +127,6 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
         if any(kw in combined_text for kw in invalid_keywords):
             return {"url": url, "valid": False, "approval_required": False, "reason": "Revoked/Invalid"}
 
-        # Expanded admin approval keyword signatures
         approval_keywords = [
             "admin approval needed",
             "admin_approval_required",
@@ -154,21 +151,33 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
 
 
 async def fetch_and_extract_from_url(client: httpx.AsyncClient, website_url: str) -> list[str]:
-    """Fetches HTML from a website URL and extracts all embedded WhatsApp links."""
+    """Dual-method extraction: Scans <a> href tags AND raw HTML text to guarantee zero missed links."""
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
     }
     try:
         if not website_url.startswith(("http://", "https://")):
             website_url = "https://" + website_url
             
-        res = await client.get(website_url, headers=headers, follow_redirects=True, timeout=12.0)
+        res = await client.get(website_url, headers=headers, follow_redirects=True, timeout=15.0)
         if res.status_code == 200:
-            return extract_wa_links(res.text)
+            html_content = res.text
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            found_links = set()
+            
+            # Method 1: Search all <a> tag href attributes
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                if 'chat.whatsapp.com' in href:
+                    found_links.update(extract_wa_links(href))
+                    
+            # Method 2: Search raw HTML content via regex
+            found_links.update(extract_wa_links(html_content))
+            
+            return list(found_links)
     except Exception as e:
         logger.error(f"Failed to fetch site {website_url}: {e}")
     return []
@@ -249,7 +258,10 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
 
         if not extracted_links:
-            await progress_msg.edit_text("❌ No WhatsApp group links found on the provided websites.")
+            await progress_msg.edit_text(
+                "❌ No WhatsApp group links found on the provided websites.",
+                reply_markup=get_main_menu_keyboard()
+            )
             return
 
         await process_and_validate_links(progress_msg, list(extracted_links), context)
@@ -259,7 +271,10 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
         extracted_links = extract_wa_links(update.message.text)
         
         if not extracted_links:
-            await update.message.reply_text("❌ No valid WhatsApp group links detected. Send /start to begin.")
+            await update.message.reply_text(
+                "❌ No valid WhatsApp group links detected. Send /start to begin.",
+                reply_markup=get_main_menu_keyboard()
+            )
             return
 
         progress_msg = await update.message.reply_text(f"⚡ Detected **{len(extracted_links)}** unique links. Initializing validation...", parse_mode="Markdown")
@@ -281,7 +296,10 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
     extracted_links = extract_wa_links(text_content)
     if not extracted_links:
-        await progress_msg.edit_text("❌ No valid WhatsApp group links found inside the uploaded `.txt` file.")
+        await progress_msg.edit_text(
+            "❌ No valid WhatsApp group links found inside the uploaded `.txt` file.",
+            reply_markup=get_main_menu_keyboard()
+        )
         return
 
     await progress_msg.edit_text(f"⚡ Extracted **{len(extracted_links)}** unique links from file. Initializing validation...", parse_mode="Markdown")
@@ -300,7 +318,6 @@ async def process_and_validate_links(status_message, links: list[str], context: 
             if res["valid"] and not res["approval_required"]:
                 valid_instant_join_links.append(link)
 
-            # Live progress message update every 5 links or on last link
             if idx % 5 == 0 or idx == total_links:
                 progress_bar = f"[{'█' * int(idx / total_links * 10)}{'░' * (10 - int(idx / total_links * 10))}]"
                 await status_message.edit_text(
@@ -311,7 +328,6 @@ async def process_and_validate_links(status_message, links: list[str], context: 
                 )
             await asyncio.sleep(0.3)
 
-    # Final completion update
     await status_message.edit_text(
         f"✅ **Validation Complete!**\n\n"
         f"📊 **Total Links Scanned:** {total_links}\n"
@@ -328,7 +344,6 @@ async def process_and_validate_links(status_message, links: list[str], context: 
         )
         return
 
-    # Build strict numbered format (1. Link, 2. Link, etc.)
     numbered_links = [f"{i}. {link}" for i, link in enumerate(valid_instant_join_links, 1)]
     raw_output_text = "\n".join(numbered_links)
     
@@ -339,7 +354,6 @@ async def process_and_validate_links(status_message, links: list[str], context: 
         chunk = raw_output_text[i:i + max_chars]
         await status_message.reply_text(chunk, disable_web_page_preview=True)
 
-    # Deliver output as attached .txt file backup with looping action buttons
     file_bytes = BytesIO(raw_output_text.encode("utf-8"))
     file_bytes.name = "valid_whatsapp_groups.txt"
     
@@ -358,7 +372,6 @@ async def process_and_validate_links(status_message, links: list[str], context: 
 # ==========================================
 
 def main():
-    """Starts the bot application with an explicit event loop for Python 3.14+."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -369,7 +382,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
@@ -381,4 +393,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+            
