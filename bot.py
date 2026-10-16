@@ -328,7 +328,15 @@ async def process_and_validate_links(status_message, links: list[str], context: 
 # ==========================================
 
 def main():
-    """Starts the bot application."""
+    """Starts the bot application with an explicit event loop for Python 3.14+."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Register handlers
@@ -343,3 +351,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
