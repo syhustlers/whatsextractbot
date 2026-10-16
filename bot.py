@@ -38,7 +38,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Telegram Bot is active and running!")
     def log_message(self, format, *args):
-        pass  # Suppress HTTP logs to keep output clean
+        pass
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -46,7 +46,6 @@ def run_health_server():
     logger.info(f"Render health check server bound to port {port}")
     server.serve_forever()
 
-# Start health server in a background daemon thread
 threading.Thread(target=run_health_server, daemon=True).start()
 
 # Bot Token
@@ -81,7 +80,7 @@ def extract_wa_links(text: str) -> list[str]:
 
 
 async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
-    """Checks if a WhatsApp group link is valid and does not require admin approval."""
+    """Robustly checks if a WhatsApp link is active and does not require admin approval."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -98,21 +97,40 @@ async def validate_wa_link(client: httpx.AsyncClient, url: str) -> dict:
             return {"url": url, "valid": False, "approval_required": False, "reason": "HTTP Error"}
 
         html_text = response.text
+        soup = BeautifulSoup(html_text, 'html.parser')
         
-        # Check if the invite link is invalid or revoked
-        if "Invite link is invalid" in html_text or "Reset invite link" in html_text or "Couldn't find group" in html_text:
+        # Extract Open Graph metadata tags rendered by WhatsApp servers
+        og_desc = ""
+        og_title = ""
+        meta_desc = soup.find("meta", property="og:description")
+        if meta_desc:
+            og_desc = meta_desc.get("content", "")
+        meta_title = soup.find("meta", property="og:title")
+        if meta_title:
+            og_title = meta_title.get("content", "")
+
+        combined_text = f"{html_text} {og_desc} {og_title}".lower()
+        
+        # Check if the invite link is invalid, revoked, or reset
+        invalid_keywords = [
+            "invite link is invalid",
+            "reset invite link",
+            "couldn't find group",
+            "this invite link was reset",
+            "expired"
+        ]
+        if any(kw in combined_text for kw in invalid_keywords):
             return {"url": url, "valid": False, "approval_required": False, "reason": "Revoked/Invalid"}
 
-        # Check for Admin Approval flag indicators on the web preview
-        approval_indicators = [
-            "Admin approval needed",
+        # Check for Admin Approval requirements
+        approval_keywords = [
+            "admin approval needed",
             "admin_approval_required",
-            "An admin must approve your request",
-            "Request to Join",
-            '"requires_approval":true'
+            "an admin must approve",
+            "request to join",
+            "requires_approval"
         ]
-        
-        requires_approval = any(indicator.lower() in html_text.lower() for indicator in approval_indicators)
+        requires_approval = any(kw in combined_text for kw in approval_keywords)
 
         return {
             "url": url,
@@ -163,39 +181,32 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome_text = (
         "⚡ **WhatsApp Group Validator & Scraper Bot** ⚡\n\n"
-        "Choose an option below to start:\n"
-        "1️⃣ **Scrape & Validate Websites:** Send multiple website URLs to extract and filter links automatically.\n"
-        "2️⃣ **Validate Link List / File:** Send a raw list of links or upload a `.txt` file."
+        "Choose an option below to start:"
     )
     
     if update.message:
         await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=reply_markup)
     elif update.callback_query:
-        await update.callback_query.message.edit_text(welcome_text, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.callback_query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles button clicks from the main menu."""
+    """Handles button clicks and immediately prompts user with a fresh message."""
     query = update.callback_query
     await query.answer()
 
     if query.data == "btn_scrape":
         context.user_data["state"] = STATE_AWAITING_WEBSITES
-        await query.edit_text(
-            "🌐 **Scrape & Validate Websites Mode**\n\n"
-            "Please send or paste your list of target website URLs below (one URL per line).\n\n"
-            "Example:\n"
-            "```\n"
-            "[https://example.com/groups](https://example.com/groups)\n"
-            "[https://another-site.org/whatsapp-links](https://another-site.org/whatsapp-links)\n"
-            "```",
+        await query.message.reply_text(
+            "🌐 **Scrape & Validate Websites Mode Active**\n\n"
+            "Please send or paste your list of target website URLs below (one URL per line).",
             parse_mode="Markdown"
         )
     elif query.data == "btn_validate_list":
         context.user_data["state"] = STATE_AWAITING_LINKS
-        await query.edit_text(
-            "📁 **Validate Link List Mode**\n\n"
-            "Please upload a `.txt` file containing WhatsApp group links or paste the raw list directly in chat.",
+        await query.message.reply_text(
+            "📁 **Validate Link List Mode Active**\n\n"
+            "Please upload your `.txt` file containing WhatsApp group links or paste the raw list directly in chat.",
             parse_mode="Markdown"
         )
 
@@ -209,7 +220,7 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
         urls = [line.strip() for line in update.message.text.splitlines() if line.strip()]
         
         if not urls:
-            await update.message.reply_text("❌ No valid URLs provided. Try again by pressing /start.")
+            await update.message.reply_text("❌ No valid URLs provided. Press /start to try again.")
             return
             
         progress_msg = await update.message.reply_text(f"🔍 **Scraping {len(urls)} website(s)...**", parse_mode="Markdown")
@@ -237,7 +248,7 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
         extracted_links = extract_wa_links(update.message.text)
         
         if not extracted_links:
-            await update.message.reply_text("❌ No valid WhatsApp group links detected in your message. Send /start to begin.")
+            await update.message.reply_text("❌ No valid WhatsApp group links detected. Send /start to begin.")
             return
 
         progress_msg = await update.message.reply_text(f"⚡ Detected **{len(extracted_links)}** unique links. Initializing validation...", parse_mode="Markdown")
@@ -351,4 +362,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+    
