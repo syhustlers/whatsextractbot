@@ -38,20 +38,21 @@ from telegram.ext import (
 )
 
 # --------------------------------------------------------------------------- #
-# Configuration & Multi-Key ScraperAPI Pool
+# Configuration (Hardcoded Token & ScraperAPI Pool)
 # --------------------------------------------------------------------------- #
 
 BOT_TOKEN = "8962511038:AAFvS1LZYYHwjIqVAh3Kx48irYntMcb9Y-Q"
 
-SCRAPER_KEYS = [
-    "7d566c800ca55799d6ec085d8e7c4ff2",
-    "710e8884bfe8116a3618b67640fc09a8",
-    "4b0a93603cff3838c0830d32b47005a2",
-    "233b5663191b1ee77e5fbcb920d468d8",
-    "0e8e3d38b7281b90a0bff5d43c5fe639",
-    "688792c4fe1c11dcedea4fdf6ca0f6a2",
-    "6e8d49f457f68036dd39dd2a1350805a",
-]
+def load_scraper_keys() -> list[str]:
+    return [
+        "7d566c800ca55799d6ec085d8e7c4ff2",
+        "710e8884bfe8116a3618b67640fc09a8",
+        "4b0a93603cff3838c0830d32b47005a2",
+        "233b5663191b1ee77e5fbcb920d468d8",
+        "0e8e3d38b7281b90a0bff5d43c5fe639",
+        "688792c4fe1c11dcedea4fdf6ca0f6a2",
+        "6e8d49f457f68036dd39dd2a1350805a",
+    ]
 
 HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
@@ -70,20 +71,33 @@ MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 MAX_WEBSITES = 100
 MAX_LINKS = 2000
 
-# Lowered concurrency to respect ScraperAPI free tier limits and prevent throttling
-SCRAPE_CONCURRENCY = 2
-VALIDATE_CONCURRENCY = 2
+SCRAPE_CONCURRENCY = 5
+VALIDATE_CONCURRENCY = 3
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 REQUEST_DEADLINE_SECONDS = 8.0
 SITE_DEADLINE_SECONDS = 20.0
-LINK_DEADLINE_SECONDS = 35.0
-MAX_VALIDATION_ATTEMPTS = 3
+LINK_DEADLINE_SECONDS = 75.0
+MAX_VALIDATION_ATTEMPTS = 2
 MAX_PAGE_BYTES = 3 * 1024 * 1024
 MAX_INVITE_PAGE_BYTES = 1024 * 1024
 
 RATE_LIMIT_STATUSES = {403, 429, 503}
-DEAD_STATUSES = {400, 404, 410}
+DEAD_STATUSES = {404, 410}
+
+GATEWAY_ENDPOINT = "https://api.scraperapi.com/"
+GATEWAY_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+GATEWAY_DEADLINE_SECONDS = 20.0
+GATEWAY_TOTAL_DEADLINE_SECONDS = 60.0
+GATEWAY_MAX_ATTEMPTS = 5
+MAX_KEY_WAIT_SECONDS = 10.0
+KEY_RATE_LIMIT_COOLDOWN_SECONDS = 4.0
+KEY_ERROR_COOLDOWN_SECONDS = 2.0
+KEY_SOFT_FAILURE_COOLDOWN_SECONDS = 1.0
+KEY_EXHAUSTED_COOLDOWN_SECONDS = 900.0
+KEY_INVALID_COOLDOWN_SECONDS = 3600.0
+PACING_MIN_SECONDS = 0.2
+PACING_MAX_SECONDS = 0.5
 
 PROGRESS_INTERVAL_SECONDS = 2.5
 TELEGRAM_CHUNK_LIMIT = 3800
@@ -350,27 +364,8 @@ def parse_website_urls(text: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Multi-Key Scraper-API Manager with Failover & HTTP Engine
+# HTTP engine
 # --------------------------------------------------------------------------- #
-
-class APIKeyManager:
-    """Manages multiple ScraperAPI keys and rotates automatically on exhaustion/errors."""
-    def __init__(self, keys: list[str]) -> None:
-        self.keys = keys
-        self.index = 0
-        self.lock = asyncio.Lock()
-
-    async def get_key(self) -> str:
-        async with self.lock:
-            return self.keys[self.index]
-
-    async def rotate(self) -> None:
-        async with self.lock:
-            self.index = (self.index + 1) % len(self.keys)
-            logger.warning("🔄 ScraperAPI key capped or blocked. Rotated to key index: %s", self.index)
-
-scraper_key_manager = APIKeyManager(SCRAPER_KEYS)
-
 
 class Cooldown:
     """Shared back-off gate so all workers slow down after a rate limit."""
@@ -398,44 +393,35 @@ def build_client() -> httpx.AsyncClient:
 
 
 async def http_get(
-    client: httpx.AsyncClient, url: str, max_bytes: int
+    client: httpx.AsyncClient,
+    url: str,
+    max_bytes: int,
+    params: Optional[dict[str, str]] = None,
+    timeout: Optional[httpx.Timeout] = None,
 ) -> tuple[int, str, httpx.Headers]:
-    """Streams a GET request through ScraperAPI with automatic multi-key failover."""
-    for attempt in range(len(SCRAPER_KEYS)):
-        current_key = await scraper_key_manager.get_key()
-        gateway_url = f"http://api.scraperapi.com?api_key={current_key}&url={url}"
-
-        try:
-            async with client.stream("GET", gateway_url) as response:
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total >= max_bytes:
-                        break
-                status = response.status_code
-                headers = response.headers
-                encoding = response.encoding or "utf-8"
-
-            if status in {403, 429}:
-                await scraper_key_manager.rotate()
-                continue
-
-            raw = b"".join(chunks)[:max_bytes]
-            try:
-                text = raw.decode(encoding, errors="replace")
-            except LookupError:
-                text = raw.decode("utf-8", errors="replace")
-            return status, text, headers
-
-        except Exception as exc:
-            logger.debug("ScraperAPI request error with key index %s: %s", scraper_key_manager.index, exc)
-            await scraper_key_manager.rotate()
-            if attempt == len(SCRAPER_KEYS) - 1:
-                raise exc
-
-    return 500, "", httpx.Headers()
+    """Streams a GET request, capping the body size, and returns decoded text."""
+    request_kwargs: dict[str, Any] = {}
+    if params is not None:
+        request_kwargs["params"] = params
+    if timeout is not None:
+        request_kwargs["timeout"] = timeout
+    async with client.stream("GET", url, **request_kwargs) as response:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+        status = response.status_code
+        headers = response.headers
+        encoding = response.encoding or "utf-8"
+    raw = b"".join(chunks)[:max_bytes]
+    try:
+        text = raw.decode(encoding, errors="replace")
+    except LookupError:
+        text = raw.decode("utf-8", errors="replace")
+    return status, text, headers
 
 
 def retry_delay(headers: httpx.Headers, attempt: int) -> float:
@@ -446,8 +432,198 @@ def retry_delay(headers: httpx.Headers, attempt: int) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# ScraperAPI multi-key gateway
+# --------------------------------------------------------------------------- #
+
+class GatewayUnavailable(Exception):
+    """Raised when no ScraperAPI key could complete the request."""
+
+
+class APIKeyManager:
+    """Round-robin ScraperAPI key pool with per-key cooldowns and failover."""
+
+    def __init__(self, keys: list[str]) -> None:
+        unique: list[str] = []
+        for key in keys:
+            key = key.strip()
+            if key and key not in unique:
+                unique.append(key)
+        self._keys = unique
+        count = len(unique)
+        self._lock = asyncio.Lock()
+        self._cursor = 0
+        self._blocked_until = [0.0] * count
+        self._unusable = [False] * count
+        self._requests = [0] * count
+        self._failures = [0] * count
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._keys)
+
+    @property
+    def size(self) -> int:
+        return len(self._keys)
+
+    def label(self, index: int) -> str:
+        return f"#{index + 1}(...{self._keys[index][-4:]})"
+
+    async def acquire(self) -> Optional[tuple[int, str]]:
+        async with self._lock:
+            now = time.monotonic()
+            count = len(self._keys)
+            for offset in range(count):
+                index = (self._cursor + offset) % count
+                if self._blocked_until[index] <= now:
+                    self._cursor = (index + 1) % count
+                    self._requests[index] += 1
+                    self._unusable[index] = False
+                    return index, self._keys[index]
+            return None
+
+    async def shortest_wait(self) -> Optional[float]:
+        async with self._lock:
+            if not self._keys:
+                return None
+            now = time.monotonic()
+            return max(0.0, min(until - now for until in self._blocked_until))
+
+    async def _block(self, index: int, seconds: float, unusable: bool = False) -> None:
+        async with self._lock:
+            self._failures[index] += 1
+            self._blocked_until[index] = max(
+                self._blocked_until[index], time.monotonic() + seconds
+            )
+            if unusable:
+                self._unusable[index] = True
+
+    async def report_rate_limited(self, index: int) -> None:
+        logger.info("ScraperAPI key %s rate-limited, rotating", self.label(index))
+        await self._block(index, KEY_RATE_LIMIT_COOLDOWN_SECONDS)
+
+    async def report_error(self, index: int) -> None:
+        await self._block(index, KEY_ERROR_COOLDOWN_SECONDS)
+
+    async def report_soft_failure(self, index: int) -> None:
+        await self._block(index, KEY_SOFT_FAILURE_COOLDOWN_SECONDS)
+
+    async def report_exhausted(self, index: int) -> None:
+        logger.warning("ScraperAPI key %s is out of credits, resting it", self.label(index))
+        await self._block(index, KEY_EXHAUSTED_COOLDOWN_SECONDS, unusable=True)
+
+    async def report_invalid(self, index: int) -> None:
+        logger.warning("ScraperAPI key %s was rejected as invalid", self.label(index))
+        await self._block(index, KEY_INVALID_COOLDOWN_SECONDS, unusable=True)
+
+    def health_note(self) -> str:
+        if not self._keys:
+            return "ℹ️ No ScraperAPI keys loaded."
+        now = time.monotonic()
+        out = sum(
+            1
+            for index in range(len(self._keys))
+            if self._unusable[index] and self._blocked_until[index] > now
+        )
+        if out:
+            return f"⚠️ {out} of {len(self._keys)} ScraperAPI keys are out of credits or invalid."
+        return ""
+
+    def usage_summary(self) -> str:
+        return ", ".join(
+            f"{self.label(i)}: {self._requests[i]} req/{self._failures[i]} fail"
+            for i in range(len(self._keys))
+        )
+
+
+KEY_MANAGER = APIKeyManager(load_scraper_keys())
+
+
+async def gateway_get(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    url: str,
+    max_bytes: int,
+) -> tuple[int, str, httpx.Headers]:
+    for _attempt in range(GATEWAY_MAX_ATTEMPTS):
+        lease = await KEY_MANAGER.acquire()
+        if lease is None:
+            wait = await KEY_MANAGER.shortest_wait()
+            if wait is None or wait > MAX_KEY_WAIT_SECONDS:
+                raise GatewayUnavailable("no ScraperAPI key is currently available")
+            await asyncio.sleep(wait + 0.05)
+            continue
+
+        index, key = lease
+        try:
+            async with sem:
+                status, text, headers = await asyncio.wait_for(
+                    http_get(
+                        client,
+                        GATEWAY_ENDPOINT,
+                        max_bytes,
+                        params={"api_key": key, "url": url},
+                        timeout=GATEWAY_TIMEOUT,
+                    ),
+                    GATEWAY_DEADLINE_SECONDS,
+                )
+                await asyncio.sleep(random.uniform(PACING_MIN_SECONDS, PACING_MAX_SECONDS))
+        except Exception as exc:
+            logger.info(
+                "Gateway request error via key %s: %s",
+                KEY_MANAGER.label(index),
+                exc.__class__.__name__,
+            )
+            await KEY_MANAGER.report_error(index)
+            await asyncio.sleep(0.3)
+            continue
+
+        if status == 429:
+            await KEY_MANAGER.report_rate_limited(index)
+            continue
+        if status == 401:
+            await KEY_MANAGER.report_invalid(index)
+            continue
+        if status == 403:
+            await KEY_MANAGER.report_exhausted(index)
+            continue
+        if status >= 500:
+            await KEY_MANAGER.report_soft_failure(index)
+            await asyncio.sleep(0.5)
+            continue
+        return status, text, headers
+
+    raise GatewayUnavailable("ScraperAPI attempts exhausted")
+
+
+# --------------------------------------------------------------------------- #
 # Website scraping engine
 # --------------------------------------------------------------------------- #
+
+async def _direct_scrape_once(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    cooldown: Cooldown,
+    url: str,
+) -> tuple[Optional[list[str]], bool]:
+    await cooldown.wait()
+    try:
+        async with sem:
+            status, text, headers = await asyncio.wait_for(
+                http_get(client, url, MAX_PAGE_BYTES), SITE_DEADLINE_SECONDS
+            )
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+    except Exception as exc:
+        logger.info("Direct scrape failed for %s: %s", url, exc.__class__.__name__)
+        return None, True
+    if status < 400:
+        return extract_whatsapp_codes(text), False
+    if status in RATE_LIMIT_STATUSES:
+        cooldown.trigger(retry_delay(headers, 0))
+        return None, True
+    if status >= 500:
+        return None, True
+    return None, False
+
 
 async def scrape_site(
     client: httpx.AsyncClient,
@@ -455,27 +631,26 @@ async def scrape_site(
     cooldown: Cooldown,
     url: str,
 ) -> list[str]:
-    for attempt in range(2):
-        await cooldown.wait()
+    codes, fallback_may_help = await _direct_scrape_once(client, sem, cooldown, url)
+    if codes is not None:
+        return codes
+    if not fallback_may_help:
+        return []
+
+    if KEY_MANAGER.enabled:
         try:
-            async with sem:
-                status, text, headers = await asyncio.wait_for(
-                    http_get(client, url, MAX_PAGE_BYTES), SITE_DEADLINE_SECONDS
-                )
-                await asyncio.sleep(random.uniform(0.1, 0.3))
+            status, text, _headers = await asyncio.wait_for(
+                gateway_get(client, sem, url, MAX_PAGE_BYTES),
+                GATEWAY_TOTAL_DEADLINE_SECONDS,
+            )
         except Exception as exc:
-            logger.info("Scrape failed for %s: %s", url, exc.__class__.__name__)
-            if attempt == 0:
-                await asyncio.sleep(1.0)
-                continue
+            logger.info("Gateway scrape failed for %s: %s", url, exc.__class__.__name__)
             return []
-        if status in RATE_LIMIT_STATUSES:
-            cooldown.trigger(retry_delay(headers, attempt))
-            continue
-        if status >= 400:
-            return []
-        return extract_whatsapp_codes(text)
-    return []
+        return extract_whatsapp_codes(text) if status < 400 else []
+
+    await asyncio.sleep(1.0)
+    codes, _ = await _direct_scrape_once(client, sem, cooldown, url)
+    return codes or []
 
 
 async def scrape_all(
@@ -542,7 +717,6 @@ def _meta_content(soup: BeautifulSoup, prop: str) -> str:
 
 
 def classify_invite_page(page: str) -> str:
-    """Classifies a WhatsApp invite page as valid, dead, approval or unknown."""
     if len(page.strip()) < 200:
         return STATUS_UNKNOWN
 
@@ -579,22 +753,30 @@ async def validate_code(
     code: str,
 ) -> str:
     url = code_to_link(code)
+    use_gateway = KEY_MANAGER.enabled
     for attempt in range(MAX_VALIDATION_ATTEMPTS):
-        await cooldown.wait()
         try:
-            async with sem:
+            if use_gateway:
                 status, text, headers = await asyncio.wait_for(
-                    http_get(client, url, MAX_INVITE_PAGE_BYTES),
-                    REQUEST_DEADLINE_SECONDS,
+                    gateway_get(client, sem, url, MAX_INVITE_PAGE_BYTES),
+                    GATEWAY_TOTAL_DEADLINE_SECONDS,
                 )
-                # Gentle pacing delay to prevent ScraperAPI rate limits
-                await asyncio.sleep(1.0)
+            else:
+                await cooldown.wait()
+                async with sem:
+                    status, text, headers = await asyncio.wait_for(
+                        http_get(client, url, MAX_INVITE_PAGE_BYTES),
+                        REQUEST_DEADLINE_SECONDS,
+                    )
+                    await asyncio.sleep(
+                        random.uniform(PACING_MIN_SECONDS, PACING_MAX_SECONDS)
+                    )
         except Exception as exc:
             logger.debug("Validation request error for %s: %s", code, exc.__class__.__name__)
-            await asyncio.sleep(1.5 * (attempt + 1))
+            await asyncio.sleep(1.0 * (attempt + 1))
             continue
 
-        if status in RATE_LIMIT_STATUSES:
+        if not use_gateway and status in RATE_LIMIT_STATUSES:
             cooldown.trigger(retry_delay(headers, attempt))
             continue
         if status in DEAD_STATUSES:
@@ -610,9 +792,9 @@ async def validate_code(
     return STATUS_UNKNOWN
 
 
-def _validation_progress_text(done: int, total: int, counts: Counter) -> str:
+def _validation_progress_text(title: str, done: int, total: int, counts: Counter) -> str:
     return (
-        f"🧪 Validating links: {done}/{total}\n"
+        f"{title}: {done}/{total}\n"
         f"✅ Instant-join: {counts[STATUS_VALID]}\n"
         f"⛔ Dead/expired: {counts[STATUS_DEAD]}\n"
         f"🔒 Admin approval: {counts[STATUS_APPROVAL]}\n"
@@ -624,6 +806,7 @@ async def validate_all(
     client: httpx.AsyncClient,
     codes: list[str],
     progress: ProgressReporter,
+    title: str = "🧪 Validating links",
 ) -> dict[str, str]:
     sem = asyncio.Semaphore(VALIDATE_CONCURRENCY)
     cooldown = Cooldown()
@@ -643,7 +826,7 @@ async def validate_all(
         counts[status] += 1
         done = len(statuses)
         await progress.update(
-            _validation_progress_text(done, total, counts), force=done == total
+            _validation_progress_text(title, done, total, counts), force=done == total
         )
 
     tasks = [asyncio.create_task(worker(code)) for code in codes]
@@ -781,6 +964,20 @@ async def run_job(
                 return
 
             statuses = await validate_all(client, all_codes, progress)
+
+            unverified = [c for c in all_codes if statuses.get(c) == STATUS_UNKNOWN]
+            if unverified:
+                await asyncio.sleep(3.0)
+                retry_statuses = await validate_all(
+                    client, unverified, progress, title="🔁 Retrying unverified links"
+                )
+                statuses.update(retry_statuses)
+
+            key_note = KEY_MANAGER.health_note()
+            if key_note:
+                note = (note + "\n" + key_note).strip()
+            if KEY_MANAGER.enabled:
+                logger.info("ScraperAPI usage: %s", KEY_MANAGER.usage_summary())
 
         await progress.update(
             f"✅ Finished checking {len(all_codes)} links. Sending results...",
@@ -1019,6 +1216,7 @@ def main() -> None:
         sys.exit(1)
 
     start_health_server()
+    logger.info("ScraperAPI gateway: %s key(s) loaded", KEY_MANAGER.size)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
