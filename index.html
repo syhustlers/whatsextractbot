@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whatsextract Mini App</title>
+  <!-- This connects your page to Telegram -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body {
+      background-color: #121212;
+      color: #ffffff;
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding-top: 50px;
+    }
+    .btn {
+      background-color: #2481cc;
+      color: white;
+      border: none;
+      padding: 15px 30px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Whatsextract Mini App</h1>
+  <p>Your clean app interface inside Telegram!</p>
+  <button class="btn" onclick="closeApp()">Got it, Close</button>
+
+  <script>
+    // Initialize the Telegram SDK
+    const tg = window.Telegram.WebApp;
+    tg.expand(); // Make it full screen
+
+    function closeApp() {
+      tg.close();
+    }
+  </script>
+</body>
+</html>
