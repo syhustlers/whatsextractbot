@@ -1017,14 +1017,31 @@ WELCOME_TEXT = (
 BUSY_TEXT = "⏳ I'm still working on your previous batch. Please wait until it finishes."
 
 
+from telegram import WebAppInfo  # <-- Make sure this is imported if not already
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
         return
     if not context.user_data.get("busy"):
         context.user_data["state"] = None
+
+    # Replace with your actual Render web service URL
+    web_app_url = "https://whatsextractbot.onrender.com" 
+
+    # Add the Mini App button alongside your regular buttons or as a top bar option
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Open Mini App (Ad-Free)", web_app=WebAppInfo(url=web_app_url))],
+            [InlineKeyboardButton("🌐 Scrape & Validate Websites", callback_data=BTN_SCRAPE)],
+            [InlineKeyboardButton("📁 Validate Link List / File", callback_data=BTN_VALIDATE_LIST)],
+        ]
+    )
+
     await safe_send(
-        context.bot, chat.id, WELCOME_TEXT, reply_markup=main_menu_markup()
+        context.bot, chat.id, WELCOME_TEXT, reply_markup=markup
     )
 
 
