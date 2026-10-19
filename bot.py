@@ -1027,6 +1027,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.bot, chat.id, WELCOME_TEXT, reply_markup=main_menu_markup()
     )
 
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
